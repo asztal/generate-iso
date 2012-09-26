@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using IO = System.IO;
@@ -67,6 +68,7 @@ namespace Bomag.Build.Iso9660 {
 
     [Flags]
     public enum FileFlags : byte {
+        None = 0,
         Existence = 1, // Meaning it is visible to the user
         Directory = 2,
         AssociatedFile = 4,
@@ -205,6 +207,7 @@ namespace Bomag.Build.Iso9660 {
 
         public string Name { get; set; }
         public string FileSystemPath { get; set; }
+        public uint DataLength { get; set; }
 
         public File() {
         }
@@ -213,6 +216,8 @@ namespace Bomag.Build.Iso9660 {
             Name = fileInfo.Name;
             FileSystemPath = fileInfo.FullName;
             UserVisible = true;
+
+            DataLength = checked((uint)fileInfo.Length);
         }
     }
     #endregion
@@ -343,19 +348,29 @@ namespace Bomag.Build.Iso9660 {
         /// </summary>
         class DirectoryLocationMap {
             public bool Written { get; set; }
-            public uint SectorOfDirectoryDescriptor { get; private set; }
 
-            public DirectoryLocationMap(uint sectorOfDescriptor) {
-                SectorOfDirectoryDescriptor = sectorOfDescriptor;
+            public uint ExtentSector { get; private set; }
+            public uint SectorCount { get; private set; }
+            public uint DataLength { get; private set; }
+
+            public DirectoryLocationMap(uint extentSector, uint dataLength, uint sectorCount) {
+                ExtentSector = extentSector;
+                SectorCount = sectorCount;
+                DataLength = dataLength;
             }
         }
 
         class FileLocationMap {
             public bool Written { get; set; }
-            public uint SectorOfFileDescriptor { get; private set; }
 
-            public FileLocationMap(uint sectorOfDescriptor) {
-                SectorOfFileDescriptor = sectorOfDescriptor;
+            public uint ExtentSector { get; private set; }
+            public uint SectorCount { get; private set; }
+            public uint DataLength { get; private set; }
+
+            public FileLocationMap(uint sectorOfDescriptor, uint dataLength, uint sectorCount) {
+                ExtentSector = sectorOfDescriptor;
+                DataLength = dataLength;
+                SectorCount = sectorCount;
             }
         }
 
@@ -368,6 +383,28 @@ namespace Bomag.Build.Iso9660 {
                 return map;
 
             throw InvalidOperationException("The given volume ({0}) has not been allocated a volume descriptor block, therefore it cannot be written to the disk image", volume.VolumeIdentifier ?? "Unidentified");
+        }
+
+        DirectoryLocationMap GetDirectoryLocationMap(Directory directory) {
+            if (directory == null)
+                throw new ArgumentNullException("directory");
+
+            DirectoryLocationMap map;
+            if (directories.TryGetValue(directory, out map))
+                return map;
+
+            throw InvalidOperationException("The given directory ({0}) has not been allocated a directory extent, therefore it cannot be written to the disk image", directory.Name ?? "Unidentified");
+        }
+
+        FileLocationMap GetFileLocationMap(File file) {
+            if (file == null)
+                throw new ArgumentNullException("file");
+
+            FileLocationMap map;
+            if (files.TryGetValue(file, out map))
+                return map;
+
+            throw InvalidOperationException("The given file ({0}) has not been allocated a file extent, therefore it cannot be written to the disk image", file.Name ?? "Unidentified");
         }
         #endregion
 
@@ -430,6 +467,12 @@ namespace Bomag.Build.Iso9660 {
                 stream.Position = pos;
             }
         }
+
+        uint SectorsNeededForByteCount(uint bytes) {
+            if (bytes == 0)
+                return 0;
+            return 1 + ((bytes - 1) / bytesInSector);
+        }
         #endregion
 
         #region Allocation Code
@@ -443,13 +486,49 @@ namespace Bomag.Build.Iso9660 {
             SeekToNextSector();
         }
 
-        void AllocateDirectoryDescriptor(Directory directory) {
+        void AllocateDirectoryExtent(Directory directory) {
             if (directory == null)
                 throw new ArgumentNullException("directory");
             if (directories.ContainsKey(directory))
-                throw InvalidOperationException("A directory descriptor for this directory ({0}) has already been allocated", directory.Name ?? "null");
+                throw InvalidOperationException("An extent for this directory ({0}) has already been allocated", directory.Name ?? "null");
+            if (!AtStartOfSector())
+                throw InvalidOperationException("Cannot allocate an extent for this directory ({0}) because the extent must be allocated at the start of a sector. The current location is ({1}) bytes after a sector boundary.", directory.Name ?? "null", stream.Position % bytesInSector);
 
-            directories.Add(directory, new DirectoryLocationMap(GetCurrentLogicalSector()));
+            uint requiredBytes = MeasureDirectory(directory);
+            uint requiredSectors = SectorsNeededForByteCount(requiredBytes);
+            if (requiredSectors == 0)
+                requiredSectors = 1;
+
+            var dlm = new DirectoryLocationMap(GetCurrentLogicalSector(), requiredBytes, requiredSectors);
+            directories.Add(directory, dlm);
+
+            SeekToSector(dlm.ExtentSector + dlm.SectorCount);
+
+            // Now allocate all the children.
+            foreach (var dir in directory.Directories)
+                AllocateDirectoryExtent(dir);
+
+            foreach (var file in directory.Files)
+                AllocateFileExtent(file);
+        }
+
+        void AllocateFileExtent(File file) {
+            if (file == null)
+                throw new ArgumentNullException("file");
+            if (files.ContainsKey(file))
+                throw InvalidOperationException("An extent for this file ({0}) has already been allocated", file.Name ?? "null");
+            if (!AtStartOfSector())
+                throw InvalidOperationException("Cannot allocate an extent for this file ({0}) because the extent must be allocated at the start of a sector. The current location is ({1}) bytes after a sector boundary.", file.Name ?? "null", stream.Position % bytesInSector);
+
+            uint sectors = SectorsNeededForByteCount(file.DataLength);
+
+            // If a file has length zero, the length of the extent will be set to zero as well.
+            // Currently the code does not allocate a sector for the file, as common sense 
+            // would dictate.
+
+            var flm = new FileLocationMap(sectors > 0 ? GetCurrentLogicalSector() : 0, file.DataLength, sectors);
+            files.Add(file, flm);
+            SeekToSector(GetCurrentLogicalSector() + sectors);
         }
 
         void AllocateBootRecord(BootCatalog catalog) {
@@ -504,7 +583,8 @@ namespace Bomag.Build.Iso9660 {
 
             var vlm = GetVolumeLocationMap(volume);
 
-            WriteDirectory(volume.RootDirectory, null);
+            AllocateDirectoryExtent(volume.RootDirectory);
+            WriteDirectoryExtent(volume.RootDirectory, null);
 
             vlm.Written = true;
             PreservingLocation(() => WriteVolumeDescriptor(volume, isPrimary));
@@ -589,17 +669,60 @@ namespace Bomag.Build.Iso9660 {
         }
 
         #region Directory Record
+        const int bytesInBaseDirectoryRecord = 33;
+
+        uint MeasureDirectory(Directory directory) {
+            if (directory == null)
+                throw new ArgumentNullException("directory");
+
+            uint total = 0;
+
+            // Account for the space that will be taken up by the pointers to 
+            // itself and its parent directory.
+            total += MeasureDirectoryRecord("\000") * 2;
+
+            // ReSharper disable LoopCanBeConvertedToQuery
+            // (Doing so causes a compile error because Enumerable.Sum does not have an overload for uints...)
+            if (directory.Directories != null)
+                foreach (var dir in directory.Directories)
+                    total += MeasureDirectoryRecord(dir.Name);
+
+            if (directory.Files != null)
+                foreach (var file in directory.Files)
+                    total += MeasureDirectoryRecord(file.Name);
+            // ReSharper restore LoopCanBeConvertedToQuery
+
+            return total;
+        }
+
+        uint MeasureDirectoryRecord(string name) {
+            if (name == null)
+                throw new ArgumentNullException("name");
+
+            uint length = bytesInBaseDirectoryRecord;
+            length += checked((uint)EncodeFileName(name).Length);
+            if (length % 2 == 1)
+                length++;
+
+            return length;
+        }
+
         /// <summary>
         /// Writes all the directory records for a directory and its files and subdirectories.
         /// </summary>
         /// <param name="directory">The directory to write.</param>
-        /// <param name="sectorOfParentDirectory">The sector of the parent directory, or 
-        /// <c>null</c> if the directory is the root directory.</param>
-        void WriteDirectory(Directory directory, uint? sectorOfParentDirectory) {
+        /// <param name="parent">The <c>DirectoryLocationMap</c> of the parent directory, which
+        /// contains information about the location of the parent directory's extent and the length
+        /// of its data, <c>null</c> if the directory is the root directory.</param>
+        /// <returns>The <c>DirectoryLocationMap</c> of the directory.</returns>
+        DirectoryLocationMap WriteDirectoryExtent(Directory directory, DirectoryLocationMap parent) {
             if (directory == null)
                 throw new ArgumentNullException("directory");
 
-            uint sector = GetCurrentLogicalSector();
+            var dlm = GetDirectoryLocationMap(directory);
+
+            uint sector = dlm.ExtentSector;
+            SeekToSector(sector);
             
             // We don't yet know the data length of this directory, however we can go back
             // and set it once we do know it... we just need to know where to write the 
@@ -608,46 +731,109 @@ namespace Bomag.Build.Iso9660 {
             const byte fileIdentifierOfCurrentDirectory = 0;
             const byte fileIdentifierOfParentDirectory = 1;
 
-            // Absolute Byte position (BP) of the first directory record in the disk image.
-            long bpOfFirstDirectoryRecord = stream.Position;
-
             // Write directory record for the current directory.
             // TODO Get flags/time zone from user/settings
             WriteDirectoryRecord(
                 new byte[] { fileIdentifierOfCurrentDirectory }, 
                 sector, 
-                0,
+                dlm.DataLength,
                 DateTime.Now,
                 FileFlags.Directory,
                 1);
 
-            // Absolute Byte position (BP) of the second directory record in the disk image.
-            long bpOfSecondDirectoryRecord = stream.Position;
-
             // Write parent directory record. If the sector of the parent directory isn't 
-            // specified then this directory is the root directory.
+            // specified then this directory is the root directory, therefore its '..'
+            // record points to itself.
             WriteDirectoryRecord(
-                new byte[] { fileIdentifierOfParentDirectory }, 
-                sectorOfParentDirectory ?? sector, 
-                0,
+                new byte[] { fileIdentifierOfParentDirectory },
+                parent != null ? parent.ExtentSector : sector,
+                parent != null ? parent.DataLength: dlm.DataLength,
                 DateTime.Now,
                 FileFlags.Directory, 
                 1);
 
-            // Relative byte position (RBP) of the data length field in the 
-            // directory record.
-            const int rbpOfDataLength = 10;
+            // Write all the children.
+            if (directory.Directories != null) {
+                foreach (var dir in directory.Directories) {
+                    DirectoryLocationMap childDlm = null;
+                    
+                    // Using PreservingLocation gives a warning about the behaviour of using foreach
+                    // variables in a closure, so as a safety measure, I'm doing it manually.
+                    var bp = stream.Position;
+                    try {
+                        childDlm = WriteDirectoryExtent(dir, dlm);
+                    } finally {
+                        stream.Position = bp;   
+                    }
 
-            // TODO Compute data length...
-            uint dataLength = checked((uint)(stream.Position - bpOfFirstDirectoryRecord));
+                    WriteDirectoryRecord(
+                        EncodeFileName(dir.Name), 
+                        childDlm.ExtentSector,
+                        childDlm.DataLength,
+                        DateTime.Now,
+                        FlagsFor(dir),
+                        1);
+                }
+            }
 
-            // Write the data length to the first two records
-            PreservingLocation(() => {
-                stream.Position = bpOfFirstDirectoryRecord + rbpOfDataLength;
-                WriteBothEndianUInt32(dataLength);
-                stream.Position = bpOfSecondDirectoryRecord + rbpOfDataLength;
-                WriteBothEndianUInt32(dataLength);
-            });
+            if (directory.Files != null)
+                foreach (var file in directory.Files) {
+                    var bp = stream.Position;
+                    FileLocationMap childFlm = null;
+                    try {
+                        childFlm = WriteFileExtent(file);
+                    } finally {
+                        stream.Position = bp;
+                    }
+
+                    WriteDirectoryRecord(
+                        EncodeFileName(file.Name),
+                        childFlm.ExtentSector,
+                        childFlm.DataLength,
+                        DateTime.Now,
+                        FlagsFor(file),
+                        1);
+                }
+
+            return dlm;
+        }
+
+        static FileFlags FlagsFor(Directory directory) {
+            if (directory == null)
+                throw new ArgumentNullException("directory");
+
+            var flags = FileFlags.Directory;
+            if (directory.AssociatedFile)
+                flags |= FileFlags.AssociatedFile;
+            if (directory.UserVisible)
+                flags |= FileFlags.Existence;
+            if (directory.MultiExtent)
+                flags |= FileFlags.MultiExtent;
+            if (directory.Protection)
+                flags |= FileFlags.Protection;
+            if (directory.Record)
+                flags |= FileFlags.Record;
+
+            return flags;
+        }
+
+        static FileFlags FlagsFor(File file) {
+            if (file == null)
+                throw new ArgumentNullException("file");
+
+            var flags = FileFlags.None;
+            if (file.AssociatedFile)
+                flags |= FileFlags.AssociatedFile;
+            if (file.UserVisible)
+                flags |= FileFlags.Existence;
+            if (file.MultiExtent)
+                flags |= FileFlags.MultiExtent;
+            if (file.Protection)
+                flags |= FileFlags.Protection;
+            if (file.Record)
+                flags |= FileFlags.Record;
+
+            return flags;
         }
 
         /// <summary>
@@ -667,27 +853,47 @@ namespace Bomag.Build.Iso9660 {
         /// this is the final directory record for the file.</param>
         /// <param name="volumeSequenceNumber">The 1-based index of the volume within the
         /// volume set.</param>
-        void WriteDirectoryRecord(byte[] fileIdentifier, uint sectorOfExtent, uint dataLength, DateTime recordingDateTime, FileFlags flags, int volumeSequenceNumber) {
+        void WriteDirectoryRecord(byte[] fileIdentifier, uint sectorOfExtent, uint dataLength, DateTime recordingDateTime, FileFlags flags, ushort volumeSequenceNumber) {
             if (fileIdentifier == null)
                 throw new ArgumentNullException("fileIdentifier");
             if (fileIdentifier.Length == 0)
                 throw ArgumentException("fileIdentifier", "The file or directory identifier must contain at least one byte");
 
-            const int bytesInBaseDirectoryRecord = 33;
+            var initialBP = stream.Position;
 
             int recordLength = fileIdentifier.Length + bytesInBaseDirectoryRecord;
             if (recordLength % 2 == 1)
-                recordLength++; // Pad to an even length
+                recordLength++; // Pad record to an even length
 
             if (recordLength > byte.MaxValue)
                 throw ArgumentException("directory", "The file or directory name (\"{0}\") is too long to fit in the directory record. The maximum length allowed by the ISO-9660 specification, in any compatibility level, is 31 bytes.", ascii.GetString(fileIdentifier));
+        
+            WriteByte((byte)recordLength);
+            WriteZeroBytes(1); // Extended attribute record length -- zero for now
+            WriteBothEndianUInt32(LbaFromSector(sectorOfExtent));
+            WriteBothEndianUInt32(dataLength);
+
+            WriteDateTimeForDirectoryRecord(recordingDateTime);
+            WriteByte((byte)flags);
+            WriteZeroBytes(2); // File Unit Size and Interleave Gap Size (only relevant for interleaved mode)
+
+            WriteBothEndianUInt16(volumeSequenceNumber);
+
+            WriteByte((byte)fileIdentifier.Length);
+            Write(fileIdentifier);
+            if ((bytesInBaseDirectoryRecord + fileIdentifier.Length) % 2 == 1)
+                WriteZeroBytes(1); // Padding
+
+            Debug.Assert(stream.Position == initialBP + recordLength, "WriteDirectoryRecord() wrote the wrong amount of bytes");
+
+            // No "system use" bytes to write.
         }
 
         byte[] EncodeFileName(string name) {
             if (compatibilityLevel == CompatibilityLevel.Level1) {
                 // TODO Ensure proper 8.3 compliance or just 8-compliance for directories
 
-                var sb = new StringBuilder(name);
+                var sb = new StringBuilder();
                 foreach (char c in name)
                     if (dCharactersAndSeparators.IndexOf(c) >= 0)
                         sb.Append(c);
@@ -698,6 +904,23 @@ namespace Bomag.Build.Iso9660 {
 
             // TODO Strip out characters that cannot be represented in ISO-646
             return ascii.GetBytes(name);
+        }
+
+        FileLocationMap WriteFileExtent(File file) {
+            if (file == null)
+                throw new ArgumentNullException("file");
+
+            var flm = GetFileLocationMap(file);
+
+            SeekToSector(flm.ExtentSector);
+            using (var contents = IO.File.Open(file.FileSystemPath, IO.FileMode.Open)) {
+                if (contents.Length > flm.SectorCount * bytesInSector)
+                    throw InvalidOperationException("The given file ({0}) cannot be written to the disk image because its contents have changed during the execution of the program, and its size has increased from {1} bytes to {2} bytes.", file.Name, file.DataLength, contents.Length);
+
+                contents.CopyTo(stream);
+            }
+
+            return flm;
         }
         #endregion
 
@@ -738,13 +961,13 @@ namespace Bomag.Build.Iso9660 {
         void WriteBootSectorData(byte[] data, ref uint sector) {
             SeekToSector(sector);
 
-            int sectorsOfData = data.Length / bytesInSector;
+            uint sectorsOfData = SectorsNeededForByteCount((uint)data.Length);
             if (sectorsOfData < 1)
                 sectorsOfData = 1;
 
             stream.Write(data, 0, data.Length);
 
-            sector = checked((uint)(sectorsOfData + sector));
+            sector += sectorsOfData;
         }
 
         void WriteBootCatalogValidationEntry(BootCatalog catalog) {
@@ -831,6 +1054,20 @@ namespace Bomag.Build.Iso9660 {
             var gmtOffset = checked((sbyte)((dateTime.Value - inUtc).Minutes / 15)); // Signed 8-bit value, -1 = -15 minutes from UTC, +4 = 1 hour ahead of UTC
 
             WriteDString(formatted, 16, "Date and Time");
+            WriteSignedByte(gmtOffset);
+        }
+
+        void WriteDateTimeForDirectoryRecord(DateTime dateTime) {
+            // TODO Might be corrupted if year can't fit in byte
+            WriteByte((byte)(dateTime.Year - 1900));
+            WriteByte((byte)dateTime.Month);
+            WriteByte((byte)dateTime.Day);
+            WriteByte((byte)dateTime.Hour);
+            WriteByte((byte)dateTime.Minute);
+            WriteByte((byte)dateTime.Second);
+
+            var inUtc = TimeZoneInfo.ConvertTimeToUtc(dateTime);
+            var gmtOffset = checked((sbyte)((dateTime - inUtc).Minutes / 15)); // Signed 8-bit value, -1 = -15 minutes from UTC, +4 = 1 hour ahead of UTC
             WriteSignedByte(gmtOffset);
         }
 
