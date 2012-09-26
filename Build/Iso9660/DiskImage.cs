@@ -19,6 +19,9 @@ namespace Bomag.Build.Iso9660 {
     public enum CompatibilityFlags {
         None = 0,
         LimitDirectories = 1,
+        TruncateFileNames = 2,
+        UpperCaseFileNames = 4,
+        Default = LimitDirectories | TruncateFileNames | UpperCaseFileNames,
         Strict = LimitDirectories
     }
 
@@ -272,7 +275,7 @@ namespace Bomag.Build.Iso9660 {
             string path, 
             Mode mode = Mode.Mode1, 
             CompatibilityLevel compatibilityLevel = CompatibilityLevel.Level1, 
-            CompatibilityFlags compatibilityFlags = CompatibilityFlags.Strict, 
+            CompatibilityFlags compatibilityFlags = CompatibilityFlags.Default, 
             Extensions extensions = Extensions.None) 
         {
             if (path == null)
@@ -313,7 +316,7 @@ namespace Bomag.Build.Iso9660 {
         #region Constants
         const int bytesInSector = 2048;
         const int sectorsInSystemArea = 16;
-        readonly int bytesInLogicalBlock = 512;
+        readonly int bytesInLogicalBlock = bytesInSector;
 
         const int bytesInVolumeDescriptorHeader = 7;
         const int bytesInVolumeDescriptorData = bytesInSector - bytesInVolumeDescriptorHeader;
@@ -336,7 +339,12 @@ namespace Bomag.Build.Iso9660 {
         /// </summary>
         class VolumeLocationMap {
             public bool Written { get; set; }
+            
             public uint SectorOfVolumeDescriptor { get; private set; }
+
+            public uint? SectorOfTypeLPathTable { get; set; }
+            public uint? SectorOfTypeMPathTable { get; set; }
+            public uint PathTableSize { get; set; }
 
             public VolumeLocationMap(uint sectorOfDescriptor) {
                 SectorOfVolumeDescriptor = sectorOfDescriptor;
@@ -585,6 +593,24 @@ namespace Bomag.Build.Iso9660 {
 
             AllocateDirectoryExtent(volume.RootDirectory);
             WriteDirectoryExtent(volume.RootDirectory, null);
+            stream.Seek(0, IO.SeekOrigin.End);
+            
+            // TODO Need to change the allocation code to keep a pointer
+            //      to where new data is to be allocated
+            SeekToNextSector();
+
+            vlm.SectorOfTypeLPathTable = GetCurrentLogicalSector();
+            WritePathTable(volume, false);
+            uint typeLSize = checked((uint)(stream.Position - BytePositionFromSector(vlm.SectorOfTypeLPathTable.Value)));
+            
+            if (!AtStartOfSector())
+                SeekToNextSector();
+            vlm.SectorOfTypeMPathTable = GetCurrentLogicalSector();
+            WritePathTable(volume, true);
+            uint typeMSize = checked((uint)(stream.Position - BytePositionFromSector(vlm.SectorOfTypeMPathTable.Value)));
+
+            Debug.Assert(typeLSize == typeMSize, "Path table sizes are inconsistent", "Type L Size: {0}\nType M Size: {1}", typeLSize, typeMSize);
+            vlm.PathTableSize = typeLSize;
 
             vlm.Written = true;
             PreservingLocation(() => WriteVolumeDescriptor(volume, isPrimary));
@@ -599,6 +625,11 @@ namespace Bomag.Build.Iso9660 {
                 throw ArgumentException("volume", "The given volume ({0}) must have a root directory", volume.VolumeIdentifier ?? "Unidentified");
 
             var vlm = GetVolumeLocationMap(volume);
+            if (!vlm.SectorOfTypeLPathTable.HasValue)
+                throw InvalidOperationException("The volume descriptor given volume ({0}) cannot be written because the type L path table for the volume has not been written", volume.VolumeIdentifier ?? "Unidentified");
+            if (!vlm.SectorOfTypeMPathTable.HasValue)
+                throw InvalidOperationException("The volume descriptor given volume ({0}) cannot be written because the type M path table for the volume has not been written", volume.VolumeIdentifier ?? "Unidentified");
+            
             SeekToSector(vlm.SectorOfVolumeDescriptor);
 
             WriteVolumeDescriptorHeader(isPrimary ? VolumeDescriptorType.Primary : VolumeDescriptorType.Supplementary);
@@ -620,23 +651,22 @@ namespace Bomag.Build.Iso9660 {
             WriteBothEndianUInt16(volume.LogicalBlockSize);
 
             // TODO Path Table Size
-            WriteZeroBytes(8);
+            WriteBothEndianUInt32(vlm.PathTableSize);
 
-            // TODO Type L Path Table Location
-            WriteZeroBytes(4);
+            WriteLittleEndianUInt32(LbaFromSector(vlm.SectorOfTypeLPathTable.Value));
+            WriteZeroBytes(4); // TODO Optional Type L Path Table Location
 
-            // TODO Optional Type L Path Table Location
-            WriteZeroBytes(4);
+            WriteBigEndianUInt32(LbaFromSector(vlm.SectorOfTypeMPathTable.Value));
+            WriteZeroBytes(4); // TODO Optional Type M Path Table Location
 
-            // TODO Type M Path Table Location
-            WriteZeroBytes(4);
-
-            // TODO Optional Type M Path Table Location
-            WriteZeroBytes(4);
-
-            // TODO Directory Record For Root Directory
-            WriteZeroBytes(34);
-
+            var rootDlm = GetDirectoryLocationMap(volume.RootDirectory);
+            WriteDirectoryRecord(
+                new byte[] { 0x00 },
+                rootDlm.ExtentSector,
+                rootDlm.DataLength,
+                DateTime.Now,
+                FlagsFor(volume.RootDirectory),
+                volume.VolumeSequenceNumber);
 
             WriteDString(volume.VolumeSetIdentifier, 128, "Volume Set Identifier");
             WriteAString(volume.PublisherIdentifier, 128, "Publisher Identifier");
@@ -679,28 +709,28 @@ namespace Bomag.Build.Iso9660 {
 
             // Account for the space that will be taken up by the pointers to 
             // itself and its parent directory.
-            total += MeasureDirectoryRecord("\000") * 2;
+            total += MeasureDirectoryRecord("\000", true) * 2;
 
             // ReSharper disable LoopCanBeConvertedToQuery
             // (Doing so causes a compile error because Enumerable.Sum does not have an overload for uints...)
             if (directory.Directories != null)
                 foreach (var dir in directory.Directories)
-                    total += MeasureDirectoryRecord(dir.Name);
+                    total += MeasureDirectoryRecord(dir.Name, true);
 
             if (directory.Files != null)
                 foreach (var file in directory.Files)
-                    total += MeasureDirectoryRecord(file.Name);
+                    total += MeasureDirectoryRecord(file.Name, false);
             // ReSharper restore LoopCanBeConvertedToQuery
 
             return total;
         }
 
-        uint MeasureDirectoryRecord(string name) {
+        uint MeasureDirectoryRecord(string name, bool isDirectory) {
             if (name == null)
                 throw new ArgumentNullException("name");
 
             uint length = bytesInBaseDirectoryRecord;
-            length += checked((uint)EncodeFileName(name).Length);
+            length += checked((uint)EncodeFileName(name, isDirectory).Length);
             if (length % 2 == 1)
                 length++;
 
@@ -753,6 +783,7 @@ namespace Bomag.Build.Iso9660 {
                 1);
 
             // Write all the children.
+            // TODO Sort according to ISO-9660 section 9.3
             if (directory.Directories != null) {
                 foreach (var dir in directory.Directories) {
                     DirectoryLocationMap childDlm = null;
@@ -767,7 +798,7 @@ namespace Bomag.Build.Iso9660 {
                     }
 
                     WriteDirectoryRecord(
-                        EncodeFileName(dir.Name), 
+                        EncodeFileName(dir.Name, true), 
                         childDlm.ExtentSector,
                         childDlm.DataLength,
                         DateTime.Now,
@@ -787,7 +818,7 @@ namespace Bomag.Build.Iso9660 {
                     }
 
                     WriteDirectoryRecord(
-                        EncodeFileName(file.Name),
+                        EncodeFileName(file.Name, false),
                         childFlm.ExtentSector,
                         childFlm.DataLength,
                         DateTime.Now,
@@ -795,6 +826,7 @@ namespace Bomag.Build.Iso9660 {
                         1);
                 }
 
+            dlm.Written = true;
             return dlm;
         }
 
@@ -889,20 +921,117 @@ namespace Bomag.Build.Iso9660 {
             // No "system use" bytes to write.
         }
 
-        byte[] EncodeFileName(string name) {
-            if (compatibilityLevel == CompatibilityLevel.Level1) {
-                // TODO Ensure proper 8.3 compliance or just 8-compliance for directories
+        byte[] EncodeFileName(string name, bool isDirectory) {
+            if (isDirectory && (name == "\000" || name == "\001"))
+                return new[] { (byte)name[0] };
 
-                var sb = new StringBuilder();
-                foreach (char c in name)
-                    if (dCharactersAndSeparators.IndexOf(c) >= 0)
-                        sb.Append(c);
-                name = sb.ToString();
+            bool allowTruncate = compatibilityFlags.HasFlag(CompatibilityFlags.TruncateFileNames);
+            bool level1 = compatibilityLevel == CompatibilityLevel.Level1;
+
+            int nameLen = 0, extLen = 0, verIndex = 0;
+            bool foundSep1 = false, foundSep2 = false;
+
+            var sb = new StringBuilder();
+            foreach (char currentChar in name) {
+                bool ok = false;
+                char c = currentChar;
+
+                if (!level1) {
+                    ok = true;
+                } else {
+                    if (dCharactersAndSeparators.IndexOf(c) >= 0) {
+                        ok = true;
+                    } else if (compatibilityFlags.HasFlag(CompatibilityFlags.UpperCaseFileNames)) {
+                        c = char.ToUpperInvariant(c);
+                        if (dCharactersAndSeparators.Contains(c))
+                            ok = true;
+                    }
+                }
+
+                // Applies to all compatibility levels
+                if ((byte)c == fileNameExtensionSeparator) {
+                    if (foundSep1)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because only one '.' is allowed in ISO-9660 Level 1 compatibility mode", name);
+                    if (isDirectory)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because '.' is not allowed in directory names in ISO-9660 Level 1 compatibility mode", name);
+                    foundSep1 = true;
+                }
+
+                // Applies to all compatibility levels
+                if ((byte)c == fileNameVersionSeparator) {
+                    if (foundSep2)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because only one ';' is allowed in ISO-9660 Level 1 compatibility mode", name);
+                    if (!foundSep1)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because a '.' was not found before the ';'", name);
+                    foundSep2 = true;
+                    verIndex = sb.Length + 1;
+                }
+
+                if (ok) {
+                    if (!foundSep1)
+                        nameLen++;
+                    else if(!foundSep2 && (byte)c != fileNameExtensionSeparator)
+                        extLen++;
+                    sb.Append(c);
+                }
             }
 
-            // TODO Ensure length does not exceed 31 in Compatibility Level 2 and above
 
-            // TODO Strip out characters that cannot be represented in ISO-646
+            if (foundSep2) {
+                const int minVersion = 1, maxVersion = 32767;
+                int version;
+                if (int.TryParse(sb.ToString(verIndex, sb.Length - verIndex), NumberStyles.Integer, CultureInfo.InvariantCulture, out version)) { 
+                    if (version < minVersion || version > maxVersion)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because the file version portion in ISO-9660 Level 1 compliance mode must be a number between 1 and 32767. The version for this file is {1}", name, version);
+                } else {
+                    throw ArgumentException("name", "The name \"{0}\" is invalid because the file version portion in ISO-9660 Level 1 compliance mode must be a number between 1 and 32767", name);
+                }
+            }
+
+            name = sb.ToString();
+
+            if (level1) {
+                // Ensure proper 8.3 compliance or just 8-compliance for directories
+                if (nameLen > 8)
+                    if (allowTruncate)
+                        sb.Remove(8, nameLen - 8);
+                    else
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because the maximum length of the file name portion in ISO-9660 Level 1 compliance mode is 8 characters", name);
+
+                if (extLen > 3)
+                    if (allowTruncate)
+                        sb.Remove(nameLen + 1 + extLen, extLen - 3);
+                    else
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because the maximum length of the file extension portion in ISO-9660 Level 1 compliance mode is 3 characters", name);
+            }
+
+            // Ensure file name + extension portion does not exceed 30 in all compatibility levels
+            const int maxFileNameAndExtensionLength = 30;
+            if (!isDirectory && nameLen + extLen > maxFileNameAndExtensionLength) {
+                if (allowTruncate) {
+                    string dotOnwards = name.Substring(nameLen, maxFileNameAndExtensionLength + 1);  // Include the '.'
+                    if (extLen > 30)
+                        name = dotOnwards;
+                    else
+                        name = name.Substring(0, maxFileNameAndExtensionLength - extLen) + dotOnwards;
+                } else {
+                    throw ArgumentException("name", "The file name and extension portion of the given file name ({0}) is longer than the maximum length given by section 7.5.1 of the ISO-9660 specification (which is 30), and the TruncateFileNames option is not enabled.", name);
+                }
+            }
+
+            if (nameLen == 0 && extLen == 0)
+                throw ArgumentException("name", "The file name ({0}) is invalid because neither the file name nor the file extension is specified, contrary to section 7.5.1 of the ISO-9660 specification.", name);
+
+            // Ensure length does not exceed 31 in all Compatibility Level 2 and above
+            const int maxDirectoryIdentifierLength = 31;
+            if (isDirectory && name.Length > maxDirectoryIdentifierLength) {
+                if (allowTruncate)
+                    name = name.Substring(0, maxDirectoryIdentifierLength);
+                else
+                    throw ArgumentException("name", "The given directory name ({0}) is longer than the maximum length given by section 7.6.3 of the ISO-9660 specification (which is {1}), and the TruncateFileNames option is not enabled.", name, maxDirectoryIdentifierLength);
+            }
+
+            // TODO Strip out characters that cannot be represented in ISO-646 (in Level 2 and above)
             return ascii.GetBytes(name);
         }
 
@@ -920,6 +1049,7 @@ namespace Bomag.Build.Iso9660 {
                 contents.CopyTo(stream);
             }
 
+            flm.Written = true;
             return flm;
         }
         #endregion
@@ -1028,6 +1158,62 @@ namespace Bomag.Build.Iso9660 {
             WriteVolumeDescriptorHeader(VolumeDescriptorType.BootRecord);
             WriteAString(elToritoSystemIdentifier, 64, context: "Boot System Identifier", padding: 0);
             WriteLittleEndianUInt32(sectorOfBootCatalog);
+        }
+        #endregion
+
+        #region Path Table
+        void WritePathTable(Volume volume, bool bigEndian) {
+            if (volume == null)
+                throw new ArgumentNullException("volume");
+            if (volume.RootDirectory == null)
+                throw ArgumentException("volume", "The given volume ({0}) does not have a root directory and therefore it is not possible to write the path table for it", volume.VolumeIdentifier ?? "Unidentified");
+         
+            // As with the rest of ISO-9660, path table numbers start at 1.
+            WritePathTable(volume.RootDirectory, 1, 1, bigEndian);
+        }
+
+        ushort WritePathTable(Directory directory, ushort recordNumber, ushort parentRecordNumber, bool bigEndian) {
+            if (directory == null)
+                throw new ArgumentNullException("directory");
+
+            ushort myRecordNumber = recordNumber;
+
+            WritePathTableRecord(directory, recordNumber, parentRecordNumber, bigEndian);
+            checked {
+                recordNumber++;
+            }
+
+            // TODO Order the path table records according to ISO-9660 6.9.1
+            if (directory.Directories != null)
+                foreach (var dir in directory.Directories)
+                    recordNumber = WritePathTable(dir, recordNumber, myRecordNumber, bigEndian);
+
+            return recordNumber;
+        }
+
+        void WritePathTableRecord(Directory directory, ushort recordNumber, ushort parentRecordNumber, bool bigEndian) {
+            // If it's the root directory, we should use the special name for it.
+            string name = recordNumber == parentRecordNumber ? "\000" : directory.Name;
+
+            var directoryIdentifier = EncodeFileName(name, true);
+            if (directoryIdentifier.Length > byte.MaxValue)
+                throw ArgumentException("directory", "Cannot write the path table entry for this directory ({0}) because its length ({1}) is greater than the maximum allowed value of ({2})", directory.Name ?? "Unidentified", directoryIdentifier.Length, byte.MaxValue);
+
+            WriteByte((byte)directoryIdentifier.Length);
+            WriteZeroBytes(1); // Extended attribute record length
+
+            var dlm = GetDirectoryLocationMap(directory);
+            if (bigEndian) {
+                WriteBigEndianUInt32(LbaFromSector(dlm.ExtentSector));
+                WriteBigEndianUInt16(parentRecordNumber);
+            } else {
+                WriteLittleEndianUInt32(LbaFromSector(dlm.ExtentSector));
+                WriteLittleEndianUInt16(parentRecordNumber);
+            }
+
+            Write(directoryIdentifier);
+            if (directoryIdentifier.Length % 2 == 1)
+                WriteZeroBytes(1); // Padding
         }
         #endregion
 
@@ -1179,390 +1365,5 @@ namespace Bomag.Build.Iso9660 {
             return new InvalidOperationException(string.Format(messageFormat, inserts));
         }
         #endregion
-    }
-
-    public class DiskImageWriter2 : IDisposable {
-        readonly string path;
-        readonly IO.Stream stream;
-
-        readonly Mode mode;
-        readonly CompatibilityLevel compatibilityLevel;
-        readonly CompatibilityFlags compatibilityFlags;
-        readonly Extensions extensions;
-
-        const int bytesInSector = 2048;
-        const int sectorsInSystemArea = 16;
-        readonly int bytesInLogicalBlock = 512;
-
-        const int bytesInVolumeDescriptorHeader = 7;
-        const int bytesInVolumeDescriptorData = bytesInSector - bytesInVolumeDescriptorHeader;
-
-        const string dCharacters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-        const string dCharactersAndSeparators = ".0123456789;ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-        const string aCharacters = " !=%&'()*+,-./0123456789:;<=>?ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-        const byte fileNameExtensionSeparator = 0x2E; // .
-        const byte fileNameVersionSeparator = 0x3B; // ;
-
-        public DiskImageWriter2(
-            string path, 
-            Mode mode = Mode.Mode1, 
-            CompatibilityLevel compatibilityLevel = CompatibilityLevel.Level1, 
-            CompatibilityFlags compatibilityFlags = CompatibilityFlags.Strict, 
-            Extensions extensions = Extensions.None) 
-        {
-            if (path == null)
-                throw new ArgumentNullException("path");
-            this.path = path;
-
-            this.mode = mode;
-            this.compatibilityLevel = compatibilityLevel;
-            this.compatibilityFlags = compatibilityFlags;
-            this.extensions = extensions;
-            ValidateOptions();
-
-            string dirName = IO.Path.GetDirectoryName(path);
-            Debug.Assert(dirName != null, "dirName != null");
-            if (!IO.Directory.Exists(dirName))
-                IO.Directory.CreateDirectory(dirName);
-
-            stream = IO.File.Open(path, IO.FileMode.Create, IO.FileAccess.ReadWrite, IO.FileShare.None);
-        }
-
-        private void ValidateOptions() {
-            if (mode != Mode.Mode1)
-                throw new NotSupportedException("Only ISO 9660 Mode 1 images are supported");
-            if ((extensions & Extensions.Apple) == Extensions.Apple)
-                throw new NotSupportedException("The Apple ISO 9660 extensions are not supported");
-            if ((extensions & Extensions.Udf) == Extensions.Apple)
-                throw new NotSupportedException("UDF is not supported");
-        }
-
-        public string Path {
-            get { return path; }
-        }
-
-        public string MediaType {
-            get { return "application/x-iso9660-image"; }
-        }
-
-        #region Writing
-        enum State {
-            Uninitialized,
-            WritingVolumeDescriptors,
-            WhateverComesNext
-        }
-        State state = State.Uninitialized;
-        bool hasPrimaryVolumeDescriptor = false;
-        readonly ASCIIEncoding ascii = new ASCIIEncoding();
-
-        /// <summary>
-        /// Initializes the System Area of the disk image (the first 16 sectors).
-        /// </summary>
-        public void Begin() {
-            if (state != State.Uninitialized)
-                throw new InvalidOperationException("Cannot call Begin() twice");
-
-            Debug.Assert(stream.Position == 0, "stream.Position == 0");
-
-            // This will set the bytes in the system area to zero (unless the code is running on 
-            // Windows 98 or earlier, but if you managed to get .NET 4.5 running on Windows 98,
-            // I'm sure you can change this code too).
-            stream.Seek(bytesInSector * sectorsInSystemArea, IO.SeekOrigin.Begin);
-            state = State.WritingVolumeDescriptors;
-        }
-
-        private void CheckBegun([CallerMemberName] string method = "Unknown") {
-            if (state == State.Uninitialized)
-                throw new InvalidOperationException(string.Format("You must call Begin() before calling {0}()", method));
-        }
-
-        private long WriteVolumeDescriptorHeader(VolumeDescriptorType type, byte version = 1) {
-            Debug.Assert(stream.Position % bytesInSector == 0, "Volume descriptor must be placed at the start of a logical sector");
-            if (stream.Position == bytesInSector * sectorsInSystemArea) {
-                if (type == VolumeDescriptorType.Terminator)
-                    throw new InvalidOperationException("You must at least write a primary volume descriptor");
-                if (type != VolumeDescriptorType.Primary)
-                    throw new InvalidOperationException("The first volume descriptor must be a primary volume descriptor");
-            }
-
-            long nextSectorStart = stream.Position + bytesInSector;
-            
-            Write((byte)type);
-            WriteDString("CD001", 5, "Standard Identifier");
-            Write(version);
-
-            return nextSectorStart;
-        }
-
-        public void WriteBootRecord(string bootSystemIdentifier, string bootIdentifier, byte[] bootData) {
-            if (bootSystemIdentifier == null)
-                throw new ArgumentNullException("bootSystemIdentifier");
-            if (bootIdentifier == null)
-                throw new ArgumentNullException("bootIdentifier");
-
-            var nextPos = WriteVolumeDescriptorHeader(VolumeDescriptorType.BootRecord);
-
-            const int bootIdLength = 32;
-            const int allowedBytes = bytesInVolumeDescriptorData - bootIdLength * 2;
-            if (bootData.Length > allowedBytes)
-                throw ArgumentException("bootData", "The boot sector data was too long ({0} bytes). The maximum size allowed is {1} bytes.", bootData.Length, allowedBytes);
-
-            WriteAString(bootSystemIdentifier, bootIdLength, "Boot System Identifier");
-            WriteAString(bootIdentifier, bootIdLength, "Boot Identifier");
-            Write(bootData);
-
-            FinishWritingVolumeDescriptor(nextPos);
-        }
-
-        public void WriteElToritoBootRecord(uint bootCatalogLba) {
-            var nextPos = WriteVolumeDescriptorHeader(VolumeDescriptorType.BootRecord);
-
-            WriteAString("EL TORITO SPECIFICATION", 64, context: "Boot System Identifier", padding: 0);
-
-            WriteLittleEndianUInt32(bootCatalogLba);
-
-            FinishWritingVolumeDescriptor(nextPos);
-        }
-
-        public void WritePrimaryVolumeDescriptor(string systemIdentifier, string volumeIdentifier) {
-            if (systemIdentifier == null)
-                throw new ArgumentNullException("systemIdentifier");
-            if (volumeIdentifier == null)
-                throw new ArgumentNullException("volumeIdentifier");
-
-            if (hasPrimaryVolumeDescriptor)
-                throw new InvalidOperationException("You may only write one primary volume descriptor; consider using a supplementary volume descriptor instead");
-
-            var nextPos = WriteVolumeDescriptorHeader(VolumeDescriptorType.Primary);
-
-            WriteByte(0);
-            WriteAString(systemIdentifier, 32, "System Identifier");
-            WriteDString(volumeIdentifier, 32, "Volume Identifier");
-            WriteZeroBytes(8);
-            // TODO More fields
-
-            // TODO Volume Space Size
-            WriteZeroBytes(8);
-
-            WriteZeroBytes(32);
-
-            // TODO Volume Set Size
-            WriteByte(1);
-            WriteByte(0);
-            WriteByte(0);
-            WriteByte(1);
-
-            // TODO Volume Sequence Number
-            WriteByte(1);
-            WriteByte(0);
-            WriteByte(0);
-            WriteByte(1);
-
-            // TODO Logical Block Size
-            WriteByte(0);
-            WriteByte(8);
-            WriteByte(8);
-            WriteByte(0);
-
-            // TODO Path Table Size
-            WriteZeroBytes(8);
-
-            // TODO Type L Path Table Location
-            WriteZeroBytes(4);
-
-            // TODO Optional Type L Path Table Location
-            WriteZeroBytes(4);
-
-            // TODO Type M Path Table Location
-            WriteZeroBytes(4);
-
-            // TODO Optional Type M Path Table Location
-            WriteZeroBytes(4);
-
-            // TODO Directory Record For Root Directory
-            WriteZeroBytes(34);
-
-            WriteDString("BOMAGOS_INSTALL_DISK", 128, "Volume Set Identifier");
-            WriteAString("BOMAG", 128, "Publisher Identifier");
-            WriteAString("", 128, "Data Preparer Identifier");
-            WriteAString("", 128, "Application Identifier");
-            WriteFileIdentifier("", 37, "Copyright File Identifier"); // TODO Check 8.3
-            WriteFileIdentifier("", 37, "Abstract File Identifier"); // TODO Check 8.3
-            WriteFileIdentifier("", 37, "Bibliographic File Identifier"); // TODO Check 8.3
-
-            WriteAString("0000000000000000", 17, "Creation Date and Time", 0);
-            WriteAString("0000000000000000", 17, "Modification Date and Time", 0);
-            WriteAString("0000000000000000", 17, "Expiration Date and Time", 0);
-            WriteAString("0000000000000000", 17, "Effective Date and Time", 0);
-
-            // TODO File Structure Version
-            WriteByte(1);
-
-            WriteByte(0);
-
-            hasPrimaryVolumeDescriptor = true;
-            FinishWritingVolumeDescriptor(nextPos);
-        }
-
-        public void WriteVolumeDescriptorTerminator() {
-            if (state == State.Uninitialized)
-                throw new InvalidOperationException("You must initialize the disk image before writing the volume descriptor terminator");
-            if (state != State.WritingVolumeDescriptors)
-                throw new InvalidOperationException("You cannot write another volume descriptor terminator after the volume descriptor terminator has been written");
-
-            FinishWritingVolumeDescriptor(WriteVolumeDescriptorHeader(VolumeDescriptorType.Terminator));
-            state = State.WhateverComesNext;
-        }
-
-        private void CheckStateForWritingVolumeDescriptor() {
-            if (state == State.Uninitialized)
-                throw new InvalidOperationException("You must initialize the disk image before writing volume descriptors");
-            if (state != State.WritingVolumeDescriptors)
-                throw new InvalidOperationException("You cannot write volume descriptors after the volume descriptor terminator has been written");
-        }
-
-        private void FinishWritingVolumeDescriptor(long nextSectorStart) {
-            Debug.Assert(stream.Position < nextSectorStart, "Volume descriptor data overran the sector");
-            stream.Seek(nextSectorStart, IO.SeekOrigin.Begin);
-        }
-
-        const int bytesInElToritoBootCatalogEntry = 32;
-        public void WriteElToritoBootCatalogValidationEntry(ElToritoPlatformId platformId, string idString) {
-            if (idString == null)
-                throw new ArgumentNullException("idString");
-
-            Debug.Assert(stream.Position % bytesInSector == 0, "Boot catalog must be placed at the start of a logical sector");
-            // Write validation entry
-            WriteByte(1);
-            WriteByte((byte)platformId);
-            WriteZeroBytes(2);
-            WriteAString(idString, 24, "ID String");
-            WriteZeroBytes(2); // The checksum will go here
-            WriteByte(0x55);
-            WriteByte(0xAA);
-
-            // Read back the bytes we have written
-            stream.Seek(-bytesInElToritoBootCatalogEntry, IO.SeekOrigin.Current);
-
-            var validationEntry = new byte[bytesInElToritoBootCatalogEntry];
-            stream.Read(validationEntry, 0, validationEntry.Length);
-
-            uint sum = 0;
-            for (int i = 0; i < validationEntry.Length - 1; i += 2) {
-                var lsb = validationEntry[i];
-                var msb = validationEntry[i + 1];
-                sum += lsb;
-                sum += (uint)(msb << 8);
-            }
-
-            // Write the new checksum. The checksum is defined such that
-            // the sum of all the 16-bit words in the record is 0.
-            stream.Seek(-4, IO.SeekOrigin.Current);
-            WriteLittleEndianUInt16((ushort)(65536 - sum));
-            stream.Seek(2, IO.SeekOrigin.Current);
-        }
-
-        public void WriteElToritoBootCatalogDefaultEntry(ElToritoMediaType mediaType, uint bootSectorCodeLba, ushort sectorCount, ushort loadSegment = 0) {
-            WriteByte(0x88); // Mark as bootable
-            WriteByte((byte)mediaType);
-            WriteLittleEndianUInt16(loadSegment); // Will be 7C0 if set to zero
-            WriteByte(0); // System type (spec says this should be byte 5 of the partition table found in the boot image...)
-            WriteZeroBytes(1);
-            WriteLittleEndianUInt16(sectorCount);
-            WriteLittleEndianUInt32(bootSectorCodeLba);
-            WriteZeroBytes(4);
-        }
-
-        // If no data has been written to the boot catalog it will still go forward a sector.
-        public void FinishWritingElToritoBootCatalog() {
-            long offset = stream.Position % bytesInSector;
-            stream.Seek(bytesInSector - offset, IO.SeekOrigin.Current);
-        }
-
-        public void WriteBootSector(uint sectorCount, byte[] data) {
-            long startPos = stream.Position;
-            Write(data);
-            stream.Seek(startPos + sectorCount * bytesInSector, IO.SeekOrigin.Begin);
-        }
-
-        byte[] EncodeAString(string str, int length, string context = "current") {
-            return EncodeAorDString(str, length, aCharacters, context);
-        }
-
-        byte[] EncodeDString(string str, int length, string context = "current") {
-            return EncodeAorDString(str, length, dCharacters, context);
-        }
-
-        void WriteAString(string str, int length, string context = "current", byte padding = 0x20) {
-            WriteAorDString(str, length, aCharacters, context, padding);
-        }
-
-        void WriteDString(string str, int length, string context = "current", byte padding = 0x20) {
-            WriteAorDString(str, length, dCharacters, context, padding);
-        }
-
-        // TODO Check that file is not ".", version number between 1 and 32767
-        void WriteFileIdentifier(string str, int length, string context = "current", byte padding = 0x20) {
-            WriteAorDString(str, length, dCharactersAndSeparators, context, padding);
-        }
-
-        void WriteAorDString(string str, int length, string allowedCharacters, string context = "current", byte padding = 0x20) {
-            byte[] data = EncodeAorDString(str, length, allowedCharacters, context);
-            Write(data);
-
-            while (data.Length < length--)
-                Write(padding);
-        }
-
-        byte[] EncodeAorDString(string str, int length, string allowedCharacters, string context = "current") {
-            foreach (char c in str)
-                if (allowedCharacters.IndexOf(c) < 0)
-                    throw ArgumentException("str", "The character '{0}' is not allowed in the {1} context. The following characters are allowed: {2})", c, context, allowedCharacters);
-
-            byte[] data = ascii.GetBytes(str);
-            if (data.Length > length)
-                throw ArgumentException("str", "The maximum length allowed in the {0} context is {1} bytes, but {2} bytes were given", context, length, data.Length);
-
-            return data;
-        }
-
-        void WriteZeroBytes(int count) {
-            Write(new byte[count]);
-        }
-
-        void Write(byte b) {
-            stream.WriteByte(b);
-        }
-
-        void WriteByte(byte b) {
-            stream.WriteByte(b);
-        }
-
-        void Write(byte[] data) {
-            stream.Write(data, 0, data.Length);
-        }
-
-        void WriteLittleEndianUInt16(UInt16 value) {
-            stream.WriteByte((byte)value);
-            stream.WriteByte((byte)(value >> 8));
-        }
-
-        void WriteLittleEndianUInt32(UInt32 value) {
-            stream.WriteByte((byte)value);
-            stream.WriteByte((byte)(value >> 8));
-            stream.WriteByte((byte)(value >> 16));
-            stream.WriteByte((byte)(value >> 24));
-        }
-        #endregion
-
-        #region Helpers
-        ArgumentException ArgumentException(string argumentName, string messageFormat, params object[] inserts) {
-            return new ArgumentException(string.Format(messageFormat, inserts), argumentName);
-        }
-        #endregion
-
-        public void Dispose() {
-            stream.Close();
-        }
     }
 }
