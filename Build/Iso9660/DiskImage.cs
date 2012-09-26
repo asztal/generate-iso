@@ -345,6 +345,7 @@ namespace Bomag.Build.Iso9660 {
             public uint? SectorOfTypeLPathTable { get; set; }
             public uint? SectorOfTypeMPathTable { get; set; }
             public uint PathTableSize { get; set; }
+            public uint NumberOfLBs { get; set; }
 
             public VolumeLocationMap(uint sectorOfDescriptor) {
                 SectorOfVolumeDescriptor = sectorOfDescriptor;
@@ -507,6 +508,9 @@ namespace Bomag.Build.Iso9660 {
             if (requiredSectors == 0)
                 requiredSectors = 1;
 
+            // ISO-9660 6.8.1.3
+            requiredBytes = requiredSectors * bytesInSector;
+
             var dlm = new DirectoryLocationMap(GetCurrentLogicalSector(), requiredBytes, requiredSectors);
             directories.Add(directory, dlm);
 
@@ -589,7 +593,12 @@ namespace Bomag.Build.Iso9660 {
             if (volume.RootDirectory == null)
                 throw ArgumentException("volume", "The given volume ({0}) does not have a root directory, and thus cannot be written to the disk image.", volume.VolumeIdentifier ?? "Unidentified");
 
+            // HACK
+            volume.LogicalBlockSize = checked((ushort)bytesInLogicalBlock);
+
             var vlm = GetVolumeLocationMap(volume);
+
+            var initialBP = stream.Position;
 
             AllocateDirectoryExtent(volume.RootDirectory);
             WriteDirectoryExtent(volume.RootDirectory, null);
@@ -611,7 +620,10 @@ namespace Bomag.Build.Iso9660 {
 
             Debug.Assert(typeLSize == typeMSize, "Path table sizes are inconsistent", "Type L Size: {0}\nType M Size: {1}", typeLSize, typeMSize);
             vlm.PathTableSize = typeLSize;
-
+            
+            SeekToNextSector();
+            vlm.NumberOfLBs = checked((uint)((stream.Position - initialBP) / bytesInLogicalBlock));
+            
             vlm.Written = true;
             PreservingLocation(() => WriteVolumeDescriptor(volume, isPrimary));
         }
@@ -639,8 +651,8 @@ namespace Bomag.Build.Iso9660 {
             WriteDString(volume.VolumeIdentifier, 32, "Volume Identifier");
             WriteZeroBytes(8);
 
-            // TODO Volume Space Size
-            WriteZeroBytes(8);
+            // Volume Space Size
+            WriteBothEndianUInt32(vlm.NumberOfLBs);
 
             WriteZeroBytes(32);
 
@@ -650,8 +662,8 @@ namespace Bomag.Build.Iso9660 {
             Debug.Assert(volume.LogicalBlockSize == bytesInLogicalBlock, "Logical block size cannot currently be changed");
             WriteBothEndianUInt16(volume.LogicalBlockSize);
 
-            // TODO Path Table Size
-            WriteBothEndianUInt32(vlm.PathTableSize);
+            // Path Table Size
+            WriteBothEndianUInt32(SectorsNeededForByteCount(vlm.PathTableSize) * bytesInSector);
 
             WriteLittleEndianUInt32(LbaFromSector(vlm.SectorOfTypeLPathTable.Value));
             WriteZeroBytes(4); // TODO Optional Type L Path Table Location
@@ -698,6 +710,10 @@ namespace Bomag.Build.Iso9660 {
             Write(version);
         }
 
+        // TODO ISO-9660 6.8.1
+        //      "Each Directory Record shall end in the Logical Sector in which it begins."
+        //      Potentially have to add extra paddings to system use area of items immediately
+        //      preceding the sector boundary.
         #region Directory Record
         const int bytesInBaseDirectoryRecord = 33;
 
@@ -1162,6 +1178,9 @@ namespace Bomag.Build.Iso9660 {
         #endregion
 
         #region Path Table
+        // TODO Check the depth does not go past 8 directories, and that 
+        //      total path length does not exceed 255. (Listed somewhere
+        //      as a restriction)
         void WritePathTable(Volume volume, bool bigEndian) {
             if (volume == null)
                 throw new ArgumentNullException("volume");
