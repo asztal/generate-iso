@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text;
 using IO = System.IO;
 
@@ -18,10 +17,45 @@ namespace Bomag.Build.Iso9660 {
     [Flags]
     public enum CompatibilityFlags {
         None = 0,
+        
+        /// <summary>
+        /// Limits the depth of the directory hierarchy to that specified in the ISO-9660 standard (8).
+        /// </summary>
         LimitDirectories = 1,
+        
+        /// <summary>
+        /// Allows the implementation to truncate file names to either 8.3, 30 characters, or 31 characters depending on the
+        /// compatibility level. This does not, however, protect against exceeding the 255 character path limit.
+        /// </summary>
         TruncateFileNames = 2,
+
+        /// <summary>
+        /// Allows the implementation of convert file names to upper case when writing disk images in Compatibility Level 1.
+        /// Without this flag, any lower case characters will be stripped from file names.
+        /// </summary>
         UpperCaseFileNames = 4,
-        Default = LimitDirectories | TruncateFileNames | UpperCaseFileNames,
+        
+        /// <summary>
+        /// Allows the implementation to try to resolve name conflicts by using tilde file names (e.g. MICROSOF, MICROS~1, MICROS~2)
+        /// to distinguish between file names that would otherwise be identical. 
+        /// </summary>
+        ResolveNameConflicts = 8,
+        
+        /// <summary>
+        /// File names with multiple dots are illegal in all compatibility levels - strip extra dots from the name.
+        /// </summary>
+        StripIllegalDots = 16,
+
+        /// <summary>
+        /// Limits the depth of the directory hierarchy and allows the implementation to truncate file names, convert them
+        /// to upper case, strip illegal extra dots, and resolve name conflicts.
+        /// </summary>
+        Default = LimitDirectories | TruncateFileNames | UpperCaseFileNames | StripIllegalDots | ResolveNameConflicts,
+        
+        /// <summary>
+        /// Does exactly what the ISO-9660 standard says, and doesn't modify file names in any way in order
+        /// to get file names to fit in the allowed space.
+        /// </summary>
         Strict = LimitDirectories
     }
 
@@ -147,8 +181,7 @@ namespace Bomag.Build.Iso9660 {
         /// <summary>
         /// Loads the volume contents from the file system.
         /// </summary>
-        /// <remarks>Could go into an infinite loop</remarks>
-        public Volume(string path, bool useDirectoryDates, bool useUtcDates) : this() {
+        public Volume(string path, bool useDirectoryDates, bool useUtcDates, bool setHiddenFlag) : this() {
             if (path == null)
                 throw new ArgumentNullException("path");
 
@@ -164,61 +197,57 @@ namespace Bomag.Build.Iso9660 {
                 }
             }
 
-            RootDirectory = new Directory(dir);
+            RootDirectory = new Directory(dir, setHiddenFlag);
         }
     }
 
-    public class Directory {
+    public abstract class FileSystemObject {
         public DateTime? RecordingDateTime { get; set; }
-
-        public bool UserVisible { get; set; }
+        public bool Hidden { get; set; }
         public bool AssociatedFile { get; set; }
         public bool Record { get; set; }
         public bool Protection { get; set; }
         public bool MultiExtent { get; set; }
-
+        
         public string Name { get; set; }
 
-        public List<Directory> Directories { get; set; }
-        public List<File> Files { get; set; }
+        public string MappedName { get; set; }
+        public byte[] MappedIdentifier { get; set; }
+    }
+
+    public class Directory : FileSystemObject {
+        public List<FileSystemObject> Entries { get; set; }
 
         public Directory() {
-            Directories = new List<Directory>();
-            Files = new List<File>();
+            Entries = new List<FileSystemObject>();
         }
 
-        public Directory(IO.DirectoryInfo dir) : this() {
+        public Directory(IO.DirectoryInfo dir, bool setHiddenFlag = false) : this() {
             Name = dir.Name;
-            UserVisible = true;
+            if (setHiddenFlag)
+                Hidden = dir.Attributes.HasFlag(IO.FileAttributes.Hidden);
 
             foreach(var dirInfo in dir.EnumerateDirectories())
-                Directories.Add(new Directory(dirInfo));
+                Entries.Add(new Directory(dirInfo, setHiddenFlag));
 
             foreach(var fileInfo in dir.EnumerateFiles())
-                Files.Add(new File(fileInfo));
+                Entries.Add(new File(fileInfo, setHiddenFlag));
         }
     }
 
-    public class File {
-        public DateTime? RecordingDateTime { get; set; }
-
-        public bool UserVisible { get; set; }
-        public bool AssociatedFile { get; set; }
-        public bool Record { get; set; }
-        public bool Protection { get; set; }
-        public bool MultiExtent { get; set; }
-
-        public string Name { get; set; }
+    public class File : FileSystemObject {
         public string FileSystemPath { get; set; }
         public uint DataLength { get; set; }
 
         public File() {
         }
 
-        public File(IO.FileInfo fileInfo) : this() {
+        public File(IO.FileInfo fileInfo, bool setHiddenFlag = false) : this() {
             Name = fileInfo.Name;
             FileSystemPath = fileInfo.FullName;
-            UserVisible = true;
+
+            if (setHiddenFlag)
+                Hidden = fileInfo.Attributes.HasFlag(IO.FileAttributes.Hidden);
 
             DataLength = checked((uint)fileInfo.Length);
         }
@@ -234,7 +263,6 @@ namespace Bomag.Build.Iso9660 {
         public BootCatalogEntry InitialEntry { get; set; }
 
         public List<BootSection> Sections { get; set; }
-
 
         public BootCatalog() {
             Sections = new List<BootSection>();
@@ -316,7 +344,7 @@ namespace Bomag.Build.Iso9660 {
         #region Constants
         const int bytesInSector = 2048;
         const int sectorsInSystemArea = 16;
-        readonly int bytesInLogicalBlock = bytesInSector;
+        readonly int bytesInLogicalBlock = bytesInSector; // TODO Allow changing this...
 
         const int bytesInVolumeDescriptorHeader = 7;
         const int bytesInVolumeDescriptorData = bytesInSector - bytesInVolumeDescriptorHeader;
@@ -484,6 +512,295 @@ namespace Bomag.Build.Iso9660 {
         }
         #endregion
 
+        #region Name mapping
+        const int maximumDirectoryNesting = 8;
+        const int maximumPathLength = 255;
+        const int maxFileNameAndExtensionLength = 30;
+
+        /// <summary>
+        /// Validates file names, generates 8.3 file names (if necessary), records the new names, and checks
+        /// that the directory nesting limit and maximum path length limit will not be exceeded.
+        /// </summary>
+        /// <param name="volume"></param>
+        void GenerateNames(Volume volume) {
+            if (volume == null)
+                throw new ArgumentNullException("volume");
+            if (volume.RootDirectory == null)
+                throw ArgumentException("volume", "The given volume ({0}) cannot be processed because does not have a root directory", volume.VolumeIdentifier ?? "Unidentified");
+            
+            GenerateNames(volume, volume.RootDirectory, 1, 0);
+        }
+
+        void GenerateNames(Volume volume, Directory directory, int levelInDirectoryHierarchy, int currentPathLength) {
+            if (volume == null)
+                throw new ArgumentNullException("volume");
+            if (directory == null)
+                throw new ArgumentNullException("directory");
+
+            if (directory.Entries.Any(e => e is Directory) && levelInDirectoryHierarchy == maximumDirectoryNesting)
+                throw InvalidOperationException("Cannot process this volume ({0}) because a directory ({1}) has subdirectories that would exceed the directory nesting limit of {2}.", volume.VolumeIdentifier ?? "Unidentified", directory.Name ?? "Unidentified", maximumDirectoryNesting);
+
+            foreach (var child in directory.Entries.Where(e => !e.AssociatedFile)) {
+                GenerateName(child, directory, currentPathLength);
+                if (child is Directory)
+                    GenerateNames(volume, child as Directory, levelInDirectoryHierarchy + 1, child.MappedIdentifier.Length + 1);
+            }
+
+            // We have to generate names for primary files before names can be assigned to associated files,
+            // because the associated files must have the same name as the primary file.
+            foreach (var child in directory.Entries.Where(e => !e.AssociatedFile)) {
+
+            }
+
+            // TODO Sort the file list and directory list so according to ISO-9660 9.3
+        }
+
+        void GenerateName(FileSystemObject child, Directory context, int currentPathLength) {
+            if (child == null)
+                throw new ArgumentNullException("child");
+            if (context == null)
+                throw new ArgumentNullException("context");
+
+            if (child.Name == null)
+                throw ArgumentException("child", "Cannot process a {0} in this directory ({1}) because it does not have a name", child.GetType().Name.ToLowerInvariant(), context.Name);
+            if (child.MappedName != null)
+                throw InvalidOperationException("Cannot generate a name mapping {0} ({1}) because a mapping has already been generated", child.GetType().Name.ToLowerInvariant(), child.Name);
+
+            if (child.AssociatedFile) {
+                // Find a file which has the same canonical name, then use its mapped name as the 
+                // associated file's mapped name.
+                var primary = context.Entries.FirstOrDefault(e => e.Name == child.Name && !e.AssociatedFile);
+                if (primary == null)
+                    throw ArgumentException("child", "Cannot process this associated file record ({0}) because the primary file record cannot be found in the directory ({1})", child.Name, context.Name);
+            
+                child.MappedName = primary.MappedName;
+                child.MappedIdentifier = primary.MappedIdentifier;
+                return;
+            }
+
+            int nameLen, extLen;
+            string name = TryTruncate(child.Name, child is Directory, out nameLen, out extLen);
+            bool isTruncated = name != child.Name;
+
+            // Take off the extension to generate the tilde name.
+            string extPart = name.Substring(nameLen);
+            string namePart = name.Substring(0, nameLen);
+            Func<string, bool> acceptableName = candidate => !context.Entries.Any(e => !e.AssociatedFile && e.MappedName == candidate + extPart);
+
+            string tildeName = GenerateTildeName(namePart, nameLen, true, child is Directory, child.Name, isTruncated, 4, acceptableName);
+
+            // If that didn't work, try the more severe option, which is two characters from the name,
+            // 4 hash characters based on the file name, and a tilde part. 
+            if (tildeName == null) {
+                int charsToTake = nameLen - 6;
+                string baseName = charsToTake > 0 && charsToTake < namePart.Length ? namePart.Substring(0, charsToTake) : namePart;
+                ushort hash = TildeFileNameHash(namePart);
+                tildeName = GenerateTildeName(baseName + hash.ToString("X4", CultureInfo.InvariantCulture), baseName.Length + 6, false, child is Directory, child.Name, isTruncated, 9, acceptableName);
+
+                if (tildeName == null)
+                    throw ArgumentException("name", "The directory ({0}) cannot be processed because it contains too many files or directories with names that clash with ({1})", context.Name, child.Name);
+            }
+
+            // Now add the extension and version back on.
+            tildeName += extPart;
+
+            // Now, at last, check that the name doesn't exceed the maximum path length of 255.
+            if (currentPathLength + tildeName.Length > maximumPathLength)
+                throw ArgumentException("child", "Cannot process this {0} ({1}) because its full path would exceed the maximum path size of {2} bytes", child.GetType().Name.ToLowerInvariant(), child.Name, maximumPathLength);
+
+            child.MappedName = tildeName;
+            child.MappedIdentifier = ascii.GetBytes(tildeName);
+            Debug.Assert(child.MappedIdentifier.Length == child.MappedName.Length, "ASCII Encoding generated a multi-byte output", "The name in question is {0}", child.MappedName);
+        }
+
+        // The actual algorithm used by Microsoft® Windows™ is undocumented, so we'll just use 
+        // .NET's GetHashCode and hope it's good enough.
+        ushort TildeFileNameHash(string name) {
+            return (ushort)name.GetHashCode();
+        }
+
+        string GenerateTildeName(string name, int maximumLength, bool tryWithoutTilde, bool isDirectory, string originalName, bool isTruncated, int tries, Func<string, bool> acceptableName) {
+            // We try four tilde names, then if all are taken, we just give up.
+            for (int i = tryWithoutTilde ? 0 : 1; i <= tries; i++) {
+                string tildeName = name;
+                if (i > 0)
+                    tildeName = (name.Length > maximumLength - 2 ? name.Substring(0, maximumLength - 2) : name) + "~" + i.ToString(CultureInfo.InvariantCulture);
+
+                // Check for clashes, even if the name hasn't been shortened, because it's possible some
+                // other name has been shortened and now will clash with this name...
+                if (acceptableName(tildeName))
+                    return tildeName;
+
+                if (!compatibilityFlags.HasFlag(CompatibilityFlags.ResolveNameConflicts)) {
+                    if (isTruncated)
+                        throw ArgumentException("child", "The {0} ({1}) cannot be processed because its truncated name ({2}) clashes with an existing file or directory name, and the ResolveNameConflicts option is not enabled", isDirectory ? "directory" : "file", originalName, name);
+                    throw ArgumentException("child", "The {0} ({1}) cannot be processed because its name clashes with an existing file or directory name, and the ResolveNameConflicts option is not enabled", isDirectory ? "directory" : "file", originalName);
+                }
+            }
+
+            // Failed to generate an acceptable name in the given amount of tries.
+            return null;
+        }
+
+        /// <summary>
+        /// Truncates file and directory names, depending on the compatibility flags defined. The algorithm
+        /// for truncating files to 8.3 notation is based loosely on that described on Wikipedia.
+        /// </summary>
+        string TryTruncate(string name, bool isDirectory, out int nameLength, out int extensionLength) {
+            bool level1 = compatibilityLevel == CompatibilityLevel.Level1;
+            bool allowTruncate = compatibilityFlags.HasFlag(CompatibilityFlags.TruncateFileNames);
+            bool canStripDots = compatibilityFlags.HasFlag(CompatibilityFlags.StripIllegalDots);
+
+            // Although it's technically not truncating, we should do this too, if the compatibility
+            // flags allow it. If the name isn't uppercase, and we are in Level 1 compatibility mode,
+            // any disallowed characters will be stripped from the name.
+            if (level1 && compatibilityFlags.HasFlag(CompatibilityFlags.UpperCaseFileNames))
+                name = name.ToUpperInvariant();
+
+            int nameLen = 0, extLen = 0, verIndex = 0;
+            bool foundSep1 = false, foundSep2 = false;
+
+            // Strip all invalid characters
+            var sb = new StringBuilder();
+            foreach (char currentChar in name) {
+                bool ok = false;
+                char c = currentChar;
+
+                if (level1) {
+                    if (dCharactersAndSeparators.IndexOf(c) >= 0) {
+                        ok = true;
+                    } else if (compatibilityFlags.HasFlag(CompatibilityFlags.UpperCaseFileNames)) {
+                        c = char.ToUpperInvariant(c);
+                        if (dCharactersAndSeparators.Contains(c))
+                            ok = true;
+                    }
+                } else {
+                    ok = true; // Allow any character in the file name
+                }
+                
+                // Applies to all compatibility levels
+                if ((byte)c == fileNameExtensionSeparator) {
+                    if (foundSep1) {
+                        if (foundSep2 || !canStripDots)
+                            throw ArgumentException("name", "The name \"{0}\" is invalid because only one '.' is allowed in ISO-9660 Level 1 compatibility mode", name);
+
+                        for (int i = 0; i < sb.Length; ++i)
+                            if (sb[i] == (char)fileNameExtensionSeparator)
+                                sb.Remove(i, 1);
+
+                        extLen = 0;
+                        nameLen = sb.Length;
+                    }
+
+                    if (isDirectory) {
+                        if (!canStripDots)
+                            throw ArgumentException("name", "The name \"{0}\" is invalid because '.' is not allowed in directory names in ISO-9660 Level 1 compatibility mode", name);
+
+                        ok = false;
+                    } else {
+                        foundSep1 = true;
+                    }
+                }
+
+                // Applies to all compatibility levels
+                if ((byte)c == fileNameVersionSeparator) {
+                    if (foundSep2)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because only one ';' is allowed in ISO-9660 Level 1 compatibility mode", name);
+                    if (!foundSep1)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because a '.' was not found before the ';'", name);
+                    foundSep2 = true;
+                    verIndex = sb.Length + 1;
+                }
+
+                if (ok) {
+                    if (!foundSep1)
+                        nameLen++;
+                    else if (!foundSep2 && (byte)c != fileNameExtensionSeparator)
+                        extLen++;
+                    sb.Append(c);
+                }
+            }
+
+            string initialName = name; // For use in errors
+
+            // It's possible that there's no allowed characters in the name!
+            if (sb.Length == 0) {
+                if (name.Length > 0)
+                    throw ArgumentException("name", "The name \"{0}\" is invalid because it does not contain any allowed characters, and the UpperCaseFileNames flag is not set", initialName);
+                throw ArgumentException("name", "Cannot process this file because its name is of zero length");
+            }
+
+            // Check the file version number, which can either be omitted or a number between 1 and 32767 inclusive
+            if (foundSep2) {
+                const int minVersion = 1, maxVersion = 32767;
+                int version;
+                if (int.TryParse(sb.ToString(verIndex, sb.Length - verIndex), NumberStyles.Integer, CultureInfo.InvariantCulture, out version)) {
+                    if (version < minVersion || version > maxVersion)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because the file version portion in ISO-9660 Level 1 compliance mode must be a number between 1 and 32767. The version for this file is {1}", initialName, version);
+                } else {
+                    throw ArgumentException("name", "The name \"{0}\" is invalid because the file version portion in ISO-9660 Level 1 compliance mode must be a number between 1 and 32767", initialName);
+                }
+            }
+
+            if (level1) {
+                // Ensure proper 8.3 compliance or just 8-compliance for directories
+                if (nameLen > 8) {
+                    if (!allowTruncate)
+                        throw ArgumentException("name", "The name \"{0}\" is invalid because the maximum length of the file name portion in ISO-9660 Level 1 compliance mode is 8 characters", initialName);
+                    
+                    sb.Remove(8, nameLen - 8);
+                    nameLen = 8;
+                }
+
+                if (extLen > 3) {
+                    if (!allowTruncate)
+                        throw ArgumentException("name",
+                            "The name \"{0}\" is invalid because the maximum length of the file extension portion in ISO-9660 Level 1 compliance mode is 3 characters",
+                            initialName);
+                    
+                    sb.Remove(nameLen + 1 + extLen, extLen - 3);
+                    extLen = 3;
+                }
+            }
+
+            name = sb.ToString();
+
+            // Ensure file name + extension portion does not exceed 30 in all compatibility levels
+            if (!isDirectory && nameLen + extLen > maxFileNameAndExtensionLength) {
+                if (!allowTruncate)
+                    throw ArgumentException("name", "The file name and extension portion of the given file name ({0}) is longer than the maximum length given by section 7.5.1 of the ISO-9660 specification (which is 30), and the TruncateFileNames option is not enabled.", initialName);
+
+                string dotOnwards = name.Substring(nameLen); // Include the '.'
+                if (extLen > maxFileNameAndExtensionLength) {
+                    name = dotOnwards.Substring(0, maxFileNameAndExtensionLength) + dotOnwards.Substring(1 + extLen);
+                    extLen = maxFileNameAndExtensionLength;
+                } else {
+                    name = name.Substring(0, maxFileNameAndExtensionLength - extLen) + dotOnwards;
+                }
+
+                nameLen = maxFileNameAndExtensionLength - extLen;
+            }
+
+            if (nameLen == 0 && extLen == 0)
+                throw ArgumentException("name", "The file name ({0}) is invalid because neither the file name nor the file extension is specified, contrary to section 7.5.1 of the ISO-9660 specification.", initialName);
+
+            // Ensure length does not exceed 31 in all Compatibility Level 2 and above
+            const int maxDirectoryIdentifierLength = 31;
+            if (isDirectory && name.Length > maxDirectoryIdentifierLength) {
+                if (!allowTruncate)
+                    throw ArgumentException("name", "The given directory name ({0}) is longer than the maximum length given by section 7.6.3 of the ISO-9660 specification (which is {1}), and the TruncateFileNames option is not enabled.", initialName, maxDirectoryIdentifierLength);
+
+                nameLen -= (name.Length - maxDirectoryIdentifierLength);
+                name = name.Substring(0, maxDirectoryIdentifierLength);
+            }
+
+            nameLength = nameLen;
+            extensionLength = extLen;
+
+            return name;
+        }
+        #endregion
+
         #region Allocation Code
         void AllocateVolumeDescriptor(Volume volume) {
             if (volume == null)
@@ -517,10 +834,10 @@ namespace Bomag.Build.Iso9660 {
             SeekToSector(dlm.ExtentSector + dlm.SectorCount);
 
             // Now allocate all the children.
-            foreach (var dir in directory.Directories)
+            foreach (var dir in directory.Entries.OfType<Directory>())
                 AllocateDirectoryExtent(dir);
 
-            foreach (var file in directory.Files)
+            foreach (var file in directory.Entries.OfType<File>())
                 AllocateFileExtent(file);
         }
 
@@ -561,6 +878,11 @@ namespace Bomag.Build.Iso9660 {
             // the Primary Volume Descriptor followed by the Boot Record.
             if (image.PrimaryVolume == null)
                 throw ArgumentException("image", "Cannot write this disk image because no primary volume is defined");
+
+            GenerateNames(image.PrimaryVolume);
+            foreach (var volume in image.SupplementaryVolumes)
+                GenerateNames(volume);
+
             AllocateVolumeDescriptor(image.PrimaryVolume);
             if (image.BootCatalog != null)
                 AllocateBootRecord(image.BootCatalog);
@@ -593,7 +915,7 @@ namespace Bomag.Build.Iso9660 {
             if (volume.RootDirectory == null)
                 throw ArgumentException("volume", "The given volume ({0}) does not have a root directory, and thus cannot be written to the disk image.", volume.VolumeIdentifier ?? "Unidentified");
 
-            // HACK
+            // XXX HACK While smaller logical blocks doesn't currently work
             volume.LogicalBlockSize = checked((ushort)bytesInLogicalBlock);
 
             var vlm = GetVolumeLocationMap(volume);
@@ -725,28 +1047,23 @@ namespace Bomag.Build.Iso9660 {
 
             // Account for the space that will be taken up by the pointers to 
             // itself and its parent directory.
-            total += MeasureDirectoryRecord("\000", true) * 2;
+            total += MeasureDirectoryRecord(new byte[1], true) * 2;
 
             // ReSharper disable LoopCanBeConvertedToQuery
             // (Doing so causes a compile error because Enumerable.Sum does not have an overload for uints...)
-            if (directory.Directories != null)
-                foreach (var dir in directory.Directories)
-                    total += MeasureDirectoryRecord(dir.Name, true);
-
-            if (directory.Files != null)
-                foreach (var file in directory.Files)
-                    total += MeasureDirectoryRecord(file.Name, false);
+            foreach (var child in directory.Entries)
+                total += MeasureDirectoryRecord(child.MappedIdentifier, child is Directory);
             // ReSharper restore LoopCanBeConvertedToQuery
 
             return total;
         }
 
-        uint MeasureDirectoryRecord(string name, bool isDirectory) {
-            if (name == null)
-                throw new ArgumentNullException("name");
+        uint MeasureDirectoryRecord(byte[] identifier, bool isDirectory) {
+            if (identifier == null)
+                throw new ArgumentNullException("identifier");
 
             uint length = bytesInBaseDirectoryRecord;
-            length += checked((uint)EncodeFileName(name, isDirectory).Length);
+            length += checked((uint)identifier.Length);
             if (length % 2 == 1)
                 length++;
 
@@ -800,9 +1117,9 @@ namespace Bomag.Build.Iso9660 {
 
             // Write all the children.
             // TODO Sort according to ISO-9660 section 9.3
-            if (directory.Directories != null) {
-                foreach (var dir in directory.Directories) {
-                    DirectoryLocationMap childDlm = null;
+            if (directory.Entries != null) {
+                foreach (var dir in directory.Entries.OfType<Directory>()) {
+                    DirectoryLocationMap childDlm;
                     
                     // Using PreservingLocation gives a warning about the behaviour of using foreach
                     // variables in a closure, so as a safety measure, I'm doing it manually.
@@ -814,7 +1131,7 @@ namespace Bomag.Build.Iso9660 {
                     }
 
                     WriteDirectoryRecord(
-                        EncodeFileName(dir.Name, true), 
+                        dir.MappedIdentifier, 
                         childDlm.ExtentSector,
                         childDlm.DataLength,
                         DateTime.Now,
@@ -823,10 +1140,10 @@ namespace Bomag.Build.Iso9660 {
                 }
             }
 
-            if (directory.Files != null)
-                foreach (var file in directory.Files) {
+            if (directory.Entries != null)
+                foreach (var file in directory.Entries.OfType<File>()) {
                     var bp = stream.Position;
-                    FileLocationMap childFlm = null;
+                    FileLocationMap childFlm;
                     try {
                         childFlm = WriteFileExtent(file);
                     } finally {
@@ -834,7 +1151,7 @@ namespace Bomag.Build.Iso9660 {
                     }
 
                     WriteDirectoryRecord(
-                        EncodeFileName(file.Name, false),
+                        file.MappedIdentifier,
                         childFlm.ExtentSector,
                         childFlm.DataLength,
                         DateTime.Now,
@@ -846,39 +1163,20 @@ namespace Bomag.Build.Iso9660 {
             return dlm;
         }
 
-        static FileFlags FlagsFor(Directory directory) {
-            if (directory == null)
-                throw new ArgumentNullException("directory");
+        static FileFlags FlagsFor(FileSystemObject entry) {
+            if (entry == null)
+                throw new ArgumentNullException("entry");
 
-            var flags = FileFlags.Directory;
-            if (directory.AssociatedFile)
+            var flags = entry is Directory ? FileFlags.Directory : FileFlags.None;
+            if (entry.AssociatedFile)
                 flags |= FileFlags.AssociatedFile;
-            if (directory.UserVisible)
+            if (entry.Hidden)
                 flags |= FileFlags.Existence;
-            if (directory.MultiExtent)
+            if (entry.MultiExtent)
                 flags |= FileFlags.MultiExtent;
-            if (directory.Protection)
+            if (entry.Protection)
                 flags |= FileFlags.Protection;
-            if (directory.Record)
-                flags |= FileFlags.Record;
-
-            return flags;
-        }
-
-        static FileFlags FlagsFor(File file) {
-            if (file == null)
-                throw new ArgumentNullException("file");
-
-            var flags = FileFlags.None;
-            if (file.AssociatedFile)
-                flags |= FileFlags.AssociatedFile;
-            if (file.UserVisible)
-                flags |= FileFlags.Existence;
-            if (file.MultiExtent)
-                flags |= FileFlags.MultiExtent;
-            if (file.Protection)
-                flags |= FileFlags.Protection;
-            if (file.Record)
+            if (entry.Record)
                 flags |= FileFlags.Record;
 
             return flags;
@@ -935,120 +1233,6 @@ namespace Bomag.Build.Iso9660 {
             Debug.Assert(stream.Position == initialBP + recordLength, "WriteDirectoryRecord() wrote the wrong amount of bytes");
 
             // No "system use" bytes to write.
-        }
-
-        byte[] EncodeFileName(string name, bool isDirectory) {
-            if (isDirectory && (name == "\000" || name == "\001"))
-                return new[] { (byte)name[0] };
-
-            bool allowTruncate = compatibilityFlags.HasFlag(CompatibilityFlags.TruncateFileNames);
-            bool level1 = compatibilityLevel == CompatibilityLevel.Level1;
-
-            int nameLen = 0, extLen = 0, verIndex = 0;
-            bool foundSep1 = false, foundSep2 = false;
-
-            var sb = new StringBuilder();
-            foreach (char currentChar in name) {
-                bool ok = false;
-                char c = currentChar;
-
-                if (!level1) {
-                    ok = true;
-                } else {
-                    if (dCharactersAndSeparators.IndexOf(c) >= 0) {
-                        ok = true;
-                    } else if (compatibilityFlags.HasFlag(CompatibilityFlags.UpperCaseFileNames)) {
-                        c = char.ToUpperInvariant(c);
-                        if (dCharactersAndSeparators.Contains(c))
-                            ok = true;
-                    }
-                }
-
-                // Applies to all compatibility levels
-                if ((byte)c == fileNameExtensionSeparator) {
-                    if (foundSep1)
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because only one '.' is allowed in ISO-9660 Level 1 compatibility mode", name);
-                    if (isDirectory)
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because '.' is not allowed in directory names in ISO-9660 Level 1 compatibility mode", name);
-                    foundSep1 = true;
-                }
-
-                // Applies to all compatibility levels
-                if ((byte)c == fileNameVersionSeparator) {
-                    if (foundSep2)
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because only one ';' is allowed in ISO-9660 Level 1 compatibility mode", name);
-                    if (!foundSep1)
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because a '.' was not found before the ';'", name);
-                    foundSep2 = true;
-                    verIndex = sb.Length + 1;
-                }
-
-                if (ok) {
-                    if (!foundSep1)
-                        nameLen++;
-                    else if(!foundSep2 && (byte)c != fileNameExtensionSeparator)
-                        extLen++;
-                    sb.Append(c);
-                }
-            }
-
-
-            if (foundSep2) {
-                const int minVersion = 1, maxVersion = 32767;
-                int version;
-                if (int.TryParse(sb.ToString(verIndex, sb.Length - verIndex), NumberStyles.Integer, CultureInfo.InvariantCulture, out version)) { 
-                    if (version < minVersion || version > maxVersion)
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because the file version portion in ISO-9660 Level 1 compliance mode must be a number between 1 and 32767. The version for this file is {1}", name, version);
-                } else {
-                    throw ArgumentException("name", "The name \"{0}\" is invalid because the file version portion in ISO-9660 Level 1 compliance mode must be a number between 1 and 32767", name);
-                }
-            }
-
-            name = sb.ToString();
-
-            if (level1) {
-                // Ensure proper 8.3 compliance or just 8-compliance for directories
-                if (nameLen > 8)
-                    if (allowTruncate)
-                        sb.Remove(8, nameLen - 8);
-                    else
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because the maximum length of the file name portion in ISO-9660 Level 1 compliance mode is 8 characters", name);
-
-                if (extLen > 3)
-                    if (allowTruncate)
-                        sb.Remove(nameLen + 1 + extLen, extLen - 3);
-                    else
-                        throw ArgumentException("name", "The name \"{0}\" is invalid because the maximum length of the file extension portion in ISO-9660 Level 1 compliance mode is 3 characters", name);
-            }
-
-            // Ensure file name + extension portion does not exceed 30 in all compatibility levels
-            const int maxFileNameAndExtensionLength = 30;
-            if (!isDirectory && nameLen + extLen > maxFileNameAndExtensionLength) {
-                if (allowTruncate) {
-                    string dotOnwards = name.Substring(nameLen, maxFileNameAndExtensionLength + 1);  // Include the '.'
-                    if (extLen > 30)
-                        name = dotOnwards;
-                    else
-                        name = name.Substring(0, maxFileNameAndExtensionLength - extLen) + dotOnwards;
-                } else {
-                    throw ArgumentException("name", "The file name and extension portion of the given file name ({0}) is longer than the maximum length given by section 7.5.1 of the ISO-9660 specification (which is 30), and the TruncateFileNames option is not enabled.", name);
-                }
-            }
-
-            if (nameLen == 0 && extLen == 0)
-                throw ArgumentException("name", "The file name ({0}) is invalid because neither the file name nor the file extension is specified, contrary to section 7.5.1 of the ISO-9660 specification.", name);
-
-            // Ensure length does not exceed 31 in all Compatibility Level 2 and above
-            const int maxDirectoryIdentifierLength = 31;
-            if (isDirectory && name.Length > maxDirectoryIdentifierLength) {
-                if (allowTruncate)
-                    name = name.Substring(0, maxDirectoryIdentifierLength);
-                else
-                    throw ArgumentException("name", "The given directory name ({0}) is longer than the maximum length given by section 7.6.3 of the ISO-9660 specification (which is {1}), and the TruncateFileNames option is not enabled.", name, maxDirectoryIdentifierLength);
-            }
-
-            // TODO Strip out characters that cannot be represented in ISO-646 (in Level 2 and above)
-            return ascii.GetBytes(name);
         }
 
         FileLocationMap WriteFileExtent(File file) {
@@ -1178,9 +1362,6 @@ namespace Bomag.Build.Iso9660 {
         #endregion
 
         #region Path Table
-        // TODO Check the depth does not go past 8 directories, and that 
-        //      total path length does not exceed 255. (Listed somewhere
-        //      as a restriction)
         void WritePathTable(Volume volume, bool bigEndian) {
             if (volume == null)
                 throw new ArgumentNullException("volume");
@@ -1203,8 +1384,8 @@ namespace Bomag.Build.Iso9660 {
             }
 
             // TODO Order the path table records according to ISO-9660 6.9.1
-            if (directory.Directories != null)
-                foreach (var dir in directory.Directories)
+            if (directory.Entries != null)
+                foreach (var dir in directory.Entries.OfType<Directory>())
                     recordNumber = WritePathTable(dir, recordNumber, myRecordNumber, bigEndian);
 
             return recordNumber;
@@ -1212,9 +1393,7 @@ namespace Bomag.Build.Iso9660 {
 
         void WritePathTableRecord(Directory directory, ushort recordNumber, ushort parentRecordNumber, bool bigEndian) {
             // If it's the root directory, we should use the special name for it.
-            string name = recordNumber == parentRecordNumber ? "\000" : directory.Name;
-
-            var directoryIdentifier = EncodeFileName(name, true);
+            var directoryIdentifier = recordNumber == parentRecordNumber ? new byte[1] : directory.MappedIdentifier;
             if (directoryIdentifier.Length > byte.MaxValue)
                 throw ArgumentException("directory", "Cannot write the path table entry for this directory ({0}) because its length ({1}) is greater than the maximum allowed value of ({2})", directory.Name ?? "Unidentified", directoryIdentifier.Length, byte.MaxValue);
 

@@ -31,7 +31,7 @@ namespace Bomag.Build {
                     throw new FileNotFoundException(string.Format("The given boot sector path ({0}) does not exist or is not a file.", bootSectorPath));
 
                 var diskImage = new DiskImage {
-                    PrimaryVolume = new Volume(contentPath, true, false) {
+                    PrimaryVolume = new Volume(contentPath, true, false, false) {
                         VolumeIdentifier = "BOMAGOS",
                         SystemIdentifier = "X86",
                         VolumeSetIdentifier = "BOMAGOS",
@@ -50,7 +50,16 @@ namespace Bomag.Build {
                     }
                 };
 
-                using (var writer = new DiskImageWriter(outputPath)) {
+                var supplementary = new Volume("D:\\Projects\\BomagOS\\Content2", true, false, false) {
+                    VolumeIdentifier = "SUPPLEMENTARY",
+                    SystemIdentifier = "X86",
+                    VolumeSetIdentifier = "SUPPLEMENTARY",
+                    DataPreparerIdentifier = "LEE HOUGHTON",
+                    PublisherIdentifier = "LEE HOUGHTON"
+                };
+                diskImage.SupplementaryVolumes.Add(supplementary);
+
+                using (var writer = new DiskImageWriter(outputPath, Mode.Mode1, CompatibilityLevel.Level2)) {
                     writer.WriteDiskImage(diskImage);
                 }
             } catch (Exception e) {
